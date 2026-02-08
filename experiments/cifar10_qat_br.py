@@ -26,6 +26,7 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
+from torchvision.models import resnet18, ResNet18_Weights
 import argparse
 import os
 import sys
@@ -38,132 +39,126 @@ from br import QuantizedConv2d, QuantizedLinear, QuantizedClippedReLU, BinRegula
 
 
 # ============================================================================
-# ResNet18 with Quantized Weights
+# ResNet18 Model (torchvision-based, ensures checkpoint compatibility)
 # ============================================================================
 
-def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1, num_bits_weight=32):
-    """3x3 convolution with padding - quantized version"""
-    if num_bits_weight < 32:
-        return QuantizedConv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                               padding=dilation, groups=groups, bias=False,
-                               dilation=dilation, num_bits=num_bits_weight)
-    else:
-        return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                        padding=dilation, groups=groups, bias=False, dilation=dilation)
-
-
-def conv1x1(in_planes, out_planes, stride=1, num_bits_weight=32):
-    """1x1 convolution - quantized version"""
-    if num_bits_weight < 32:
-        return QuantizedConv2d(in_planes, out_planes, kernel_size=1, stride=stride,
-                               bias=False, num_bits=num_bits_weight)
-    else:
-        return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
-
-
-class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, num_bits_weight=32, num_bits_act=32, clip_value=None):
-        super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(inplanes, planes, stride, num_bits_weight=num_bits_weight)
-        self.bn1 = nn.BatchNorm2d(planes)
-        # Use quantized ReLU if num_bits_act < 32
-        if num_bits_act < 32:
-            self.relu = QuantizedClippedReLU(clip_value=clip_value, num_bits=num_bits_act)
+def replace_relu_with_quantized(model, clip_value=None, num_bits=2):
+    """
+    Replace all ReLU layers with QuantizedClippedReLU.
+    
+    This ensures activation quantization while keeping the rest of the model structure
+    identical to torchvision's ResNet18.
+    """
+    for name, module in model.named_children():
+        if isinstance(module, nn.ReLU):
+            # Replace ReLU with QuantizedClippedReLU
+            setattr(model, name, QuantizedClippedReLU(clip_value=clip_value, num_bits=num_bits))
         else:
-            self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes, num_bits_weight=num_bits_weight)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-
-        return out
+            # Recursively replace in child modules
+            replace_relu_with_quantized(module, clip_value, num_bits)
 
 
-class ResNet18_Quantized(nn.Module):
-    def __init__(self, num_classes=10, num_bits_weight=2, num_bits_act=2, clip_value=None):
-        super(ResNet18_Quantized, self).__init__()
-        self.num_bits_weight = num_bits_weight
-        self.num_bits_act = num_bits_act
-        self.clip_value = clip_value
-        self.inplanes = 64
-
-        # First layer: quantized if num_bits_weight < 32
-        if num_bits_weight < 32:
-            self.conv1 = QuantizedConv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False, num_bits=num_bits_weight)
-        else:
-            self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        # Use quantized ReLU if num_bits_act < 32
-        if num_bits_act < 32:
-            self.relu = QuantizedClippedReLU(clip_value=clip_value, num_bits=num_bits_act)
-        else:
-            self.relu = nn.ReLU(inplace=True)
-
-        # ResNet blocks with quantized weights AND activations
-        self.layer1 = self._make_layer(64, 2, stride=1, num_bits_weight=num_bits_weight, num_bits_act=num_bits_act, clip_value=clip_value)
-        self.layer2 = self._make_layer(128, 2, stride=2, num_bits_weight=num_bits_weight, num_bits_act=num_bits_act, clip_value=clip_value)
-        self.layer3 = self._make_layer(256, 2, stride=2, num_bits_weight=num_bits_weight, num_bits_act=num_bits_act, clip_value=clip_value)
-        self.layer4 = self._make_layer(512, 2, stride=2, num_bits_weight=num_bits_weight, num_bits_act=num_bits_act, clip_value=clip_value)
-
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # Final FC layer: quantized weights
-        if num_bits_weight < 32:
-            self.fc = QuantizedLinear(512, num_classes, num_bits=num_bits_weight)
-        else:
-            self.fc = nn.Linear(512, num_classes)
-
-    def _make_layer(self, planes, blocks, stride=1, num_bits_weight=32, num_bits_act=32, clip_value=None):
-        downsample = None
-        if stride != 1 or self.inplanes != planes:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes, stride, num_bits_weight=num_bits_weight),
-                nn.BatchNorm2d(planes),
+def replace_conv_linear_with_quantized(model, num_bits=2):
+    """
+    Replace Conv2d and Linear layers with quantized versions.
+    
+    This enables weight quantization while preserving model structure.
+    """
+    for name, module in model.named_children():
+        if isinstance(module, nn.Conv2d):
+            # Replace Conv2d with QuantizedConv2d
+            new_conv = QuantizedConv2d(
+                module.in_channels, module.out_channels,
+                kernel_size=module.kernel_size, stride=module.stride,
+                padding=module.padding, dilation=module.dilation,
+                groups=module.groups, bias=(module.bias is not None),
+                num_bits=num_bits
             )
+            # Copy weights
+            if hasattr(module, 'weight'):
+                with torch.no_grad():
+                    new_conv.weight.copy_(module.weight)
+            if module.bias is not None:
+                with torch.no_grad():
+                    new_conv.bias.copy_(module.bias)
+            setattr(model, name, new_conv)
+        elif isinstance(module, nn.Linear):
+            # Replace Linear with QuantizedLinear
+            new_linear = QuantizedLinear(
+                module.in_features, module.out_features,
+                bias=(module.bias is not None),
+                num_bits=num_bits
+            )
+            # Copy weights
+            with torch.no_grad():
+                new_linear.weight.copy_(module.weight)
+            if module.bias is not None:
+                with torch.no_grad():
+                    new_linear.bias.copy_(module.bias)
+            setattr(model, name, new_linear)
+        else:
+            # Recursively replace in child modules
+            replace_conv_linear_with_quantized(module, num_bits)
 
-        layers = []
-        layers.append(BasicBlock(self.inplanes, planes, stride, downsample, 
-                                 num_bits_weight=num_bits_weight, num_bits_act=num_bits_act, clip_value=clip_value))
-        self.inplanes = planes
-        for _ in range(1, blocks):
-            layers.append(BasicBlock(self.inplanes, planes, 
-                                     num_bits_weight=num_bits_weight, num_bits_act=num_bits_act, clip_value=clip_value))
 
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-
-        return x
+def get_resnet18_cifar10_qat(num_classes=10, num_bits_weight=2, num_bits_act=2, 
+                             clip_value=None, pretrained_baseline=None):
+    """
+    Get ResNet18 with QAT for CIFAR-10.
+    
+    Uses torchvision's ResNet18 as base (ensures checkpoint compatibility),
+    then adapts for CIFAR-10 and applies quantization.
+    
+    Args:
+        num_classes: Number of output classes (default: 10 for CIFAR-10)
+        num_bits_weight: Bits for weight quantization (32 = FP32, no quantization)
+        num_bits_act: Bits for activation quantization (32 = FP32, no quantization)
+        clip_value: Activation clipping value (None=ReLU, 6.0=ReLU6, 1.0=ReLU1)
+        pretrained_baseline: Path to baseline checkpoint (optional)
+    
+    Returns:
+        ResNet18 model with quantized layers
+    """
+    # Load torchvision ResNet18 (no pretrained weights for now)
+    model = resnet18(weights=None)
+    
+    # Adapt for CIFAR-10 (32x32 images instead of 224x224)
+    # Replace 7x7 stride=2 conv with 3x3 stride=1 (CIFAR-10 is small)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    # Remove maxpool (too aggressive downsampling for 32x32)
+    model.maxpool = nn.Identity()
+    # Replace final FC for 10 classes
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    
+    # Load baseline weights if provided (BEFORE quantization)
+    if pretrained_baseline:
+        checkpoint = torch.load(pretrained_baseline, map_location='cpu')
+        
+        # Extract state dict
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Load weights (strict=False to ignore missing quantizer keys)
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in state_dict.items() 
+                          if k in model_dict and v.shape == model_dict[k].shape}
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict, strict=False)
+        # Note: We don't print here, will be done in main()
+    
+    # Apply quantization to activations (if num_bits_act < 32)
+    if num_bits_act < 32:
+        replace_relu_with_quantized(model, clip_value=clip_value, num_bits=num_bits_act)
+    
+    # Apply quantization to weights (if num_bits_weight < 32)
+    if num_bits_weight < 32:
+        replace_conv_linear_with_quantized(model, num_bits=num_bits_weight)
+    
+    return model
 
 
 # ============================================================================
@@ -443,34 +438,34 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
                              shuffle=False, num_workers=4, pin_memory=True)
 
-    # Create model
+    # Create model (uses torchvision ResNet18 for compatibility)
     clip_str = f", clip={args.clip_value}" if args.clip_value else ""
     print(f"\nCreating ResNet18 with W{args.num_bits_weight}A{args.num_bits_act} quantization{clip_str}...")
-    model = ResNet18_Quantized(num_classes=10, 
-                               num_bits_weight=args.num_bits_weight, 
-                               num_bits_act=args.num_bits_act,
-                               clip_value=args.clip_value).to(device)
-
-    # Load pretrained baseline if provided
+    
     if args.pretrained_baseline is not None:
         print(f"Loading pretrained baseline from: {args.pretrained_baseline}")
+    
+    model = get_resnet18_cifar10_qat(
+        num_classes=10,
+        num_bits_weight=args.num_bits_weight,
+        num_bits_act=args.num_bits_act,
+        clip_value=args.clip_value,
+        pretrained_baseline=args.pretrained_baseline
+    ).to(device)
+    
+    if args.pretrained_baseline is not None:
+        # Count loaded parameters (for logging)
         checkpoint = torch.load(args.pretrained_baseline, map_location='cpu')
-        
-        # Load state dict (handle keys carefully)
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         elif 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
         else:
             state_dict = checkpoint
-        
-        # Load (ignore quantizer-specific keys that don't exist in FP32)
         model_dict = model.state_dict()
-        pretrained_dict = {k: v for k, v in state_dict.items() 
-                          if k in model_dict and v.shape == model_dict[k].shape}
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict, strict=False)
-        print(f"✓ Loaded {len(pretrained_dict)} parameter tensors from baseline")
+        loaded_keys = [k for k in state_dict.keys() if k in model_dict and 
+                      state_dict[k].shape == model_dict[k].shape]
+        print(f"✓ Loaded {len(loaded_keys)} parameter tensors from baseline")
 
     # Criterion
     criterion = nn.CrossEntropyLoss()
@@ -478,9 +473,8 @@ def main():
     # Optimizer: Include all parameters (weights, BN, alpha)
     # NOTE: LSQ uses gradient scaling in forward pass (g = 1/sqrt(numel*Qp))
     # This automatically gives alpha an effective ~10x higher learning rate
-    # So we can use a single optimizer for all parameters (paper-faithful)
-    optimizer = optim.SGD(model.parameters(), lr=args.lr,
-                         momentum=args.momentum, weight_decay=args.weight_decay)
+    # Use Adam for faster convergence (matches A-BR implementation)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     # Learning rate scheduler (cosine annealing ONLY during BR phase)
     # T_max should be the BR phase duration, not total epochs
