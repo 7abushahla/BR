@@ -1,0 +1,112 @@
+================================================================================ 
+BR ALPHA CONTROL - Quick Reference
+================================================================================
+
+TWO INDEPENDENT MECHANISMS:
+
+1. --freeze-alpha
+   └─> Stops ALL alpha updates (CE + BR) after warmup
+   └─> Sets requires_grad = False
+   └─> Use for: Maximum stability, fixed quantization grid
+
+2. --br-backprop-to-alpha
+   └─> Controls whether BR gradients flow to alpha
+   └─> Default: False (detached, stable target)
+   └─> Use for: Avoiding "moving target" problem
+
+================================================================================
+RECOMMENDED USAGE (Default):
+================================================================================
+
+python cifar10_qat_br.py \
+    --num-bits 2 \
+    --lambda-br 1.0 \
+    --lambda-br-act 1.0
+
+Result:
+- ✅ BR gradients detached (stable clustering)
+- ✅ CE gradients still flow (adaptive grid)
+- ✅ Best of both worlds
+
+================================================================================
+ALTERNATIVE (Maximum Stability):
+================================================================================
+
+python cifar10_qat_br.py \
+    --freeze-alpha \
+    --num-bits 2 \
+    --lambda-br 1.0 \
+    --lambda-br-act 1.0
+
+Result:
+- ✅ Completely fixed grid during BR phase
+- ✅ No moving targets
+- ⚠️ Less adaptive (can't fix bad alpha values)
+
+================================================================================
+AVOID (Moving Target):
+================================================================================
+
+python cifar10_qat_br.py \
+    --br-backprop-to-alpha \  # NOT RECOMMENDED
+    --num-bits 2 \
+    --lambda-br 1.0 \
+    --lambda-br-act 1.0
+
+Result:
+- ❌ Levels move while BR tries to cluster
+- ❌ Can diverge or oscillate
+- ❌ Poor convergence
+
+================================================================================
+IMPLEMENTATION DETAILS:
+================================================================================
+
+In regularizer_binreg.py:
+
+    if backprop_to_alpha:
+        alpha_for_levels = alpha  # Gradients flow
+    else:
+        alpha_for_levels = alpha.item()  # Detached
+
+Key insight: Even detached, BR still clusters around CURRENT levels,
+             it just doesn't try to MOVE the levels via gradients.
+
+================================================================================
+FILES UPDATED:
+================================================================================
+
+1. BR/br/regularizer_binreg.py
+   - Added backprop_to_alpha parameter to compute_bin_loss()
+   - Added backprop_to_alpha parameter to compute_total_loss()
+   - Detaches alpha when backprop_to_alpha=False
+
+2. BR/experiments/cifar10_qat_br.py
+   - Added --br-backprop-to-alpha argument (default: False)
+   - Updated train_epoch() to pass br_backprop_to_alpha
+   - Prints alpha control settings at training start
+
+3. BR/ALPHA_CONTROL_GUIDE.md
+   - Full explanation of both mechanisms
+   - Decision matrices and examples
+   - Recommended practices
+
+4. BR/FINAL_STATUS.md
+   - Updated verification checklist
+   - Added alpha control section
+
+5. BR/FIXES_APPLIED.md
+   - Added Bug #4: Alpha Control fix
+   - Updated files modified list
+
+================================================================================
+BOTTOM LINE:
+================================================================================
+
+✅ Use default (no flags) for best results
+✅ Use --freeze-alpha for maximum stability
+❌ Avoid --br-backprop-to-alpha (moving target)
+
+See BR/ALPHA_CONTROL_GUIDE.md for detailed explanation.
+
+================================================================================

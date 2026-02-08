@@ -1,0 +1,113 @@
+================================================================================
+W-BR vs A-BR: Clean Separation Summary
+================================================================================
+
+DESIGN:
+-------
+1. W-BR (Weights):
+   - Paper-faithful approach
+   - Always allows BR gradients to alpha
+   - Stable (weights don't change batch-to-batch)
+   - Simple (no extra controls)
+
+2. A-BR (Activations):
+   - Our extension
+   - User-controlled gradient flow (default: detached for stability)
+   - Batch-dependent (needs careful handling)
+   - Sophisticated controls
+
+================================================================================
+TOGGLE BETWEEN MODES:
+================================================================================
+
+W-only BR (Original Paper):
+---------------------------
+python cifar10_qat_br.py \
+    --lambda-br 1.0 \       # W-BR enabled
+    --lambda-br-act 0.0 \   # A-BR disabled
+    --freeze-alpha
+
+Result: BR on weights only (paper-faithful)
+
+W+A BR (Full Package, Recommended):
+-----------------------------------
+python cifar10_qat_br.py \
+    --lambda-br 1.0 \       # W-BR enabled
+    --lambda-br-act 1.0 \   # A-BR enabled
+    --freeze-alpha
+
+Result: BR on both weights and activations (best performance)
+
+A-only BR (Research):
+---------------------
+python cifar10_qat_br.py \
+    --lambda-br 0.0 \       # W-BR disabled
+    --lambda-br-act 1.0 \   # A-BR enabled
+    --freeze-alpha
+
+Result: BR on activations only (isolate A-BR effects)
+
+================================================================================
+KEY DIFFERENCES:
+================================================================================
+
+W-BR:
+- Gradients to alpha: ALWAYS enabled (paper approach)
+- Stability: Inherent (weights are fixed per layer)
+- Control: --lambda-br only
+
+A-BR:
+- Gradients to alpha: Controlled by --br-backprop-to-alpha-act (default: False)
+- Stability: Needs careful handling (batch-dependent)
+- Control: --lambda-br-act and --br-backprop-to-alpha-act
+
+================================================================================
+FILES UPDATED:
+================================================================================
+
+1. BR/experiments/cifar10_qat_br.py
+   - Renamed --br-backprop-to-alpha → --br-backprop-to-alpha-act
+   - W-BR always uses backprop_to_alpha=True
+   - A-BR uses user flag (default: False)
+   - Updated training printout to show separate W-BR/A-BR status
+
+2. BR/W_BR_vs_A_BR_GUIDE.md (NEW)
+   - Comprehensive guide on W-BR vs A-BR
+   - Usage scenarios and examples
+   - Implementation details
+
+3. BR/QUICKSTART.md
+   - Added Step 2.5: Toggle between W-only and W+A
+   - Updated training phase descriptions
+
+4. BR/FINAL_STATUS.md
+   - Updated Alpha Control section to reflect W-BR vs A-BR separation
+
+================================================================================
+RECOMMENDATION:
+================================================================================
+
+For most cases: Use W+A BR with default settings
+python cifar10_qat_br.py \
+    --lambda-br 1.0 \
+    --lambda-br-act 1.0 \
+    --freeze-alpha
+    # Default: br-backprop-to-alpha-act=False (stable)
+
+This gives:
+✅ W-BR: Paper-faithful (gradients flow, stable for weights)
+✅ A-BR: Stable (gradients detached, avoids moving target)
+✅ Best performance
+✅ Clean toggle via lambda values
+
+================================================================================
+DOCUMENTATION:
+================================================================================
+
+See these files for more details:
+- W_BR_vs_A_BR_GUIDE.md: Complete guide with scenarios and examples
+- ALPHA_CONTROL_GUIDE.md: Deep dive into gradient flow and alpha control
+- QUICKSTART.md: Quick start with practical examples
+- FINAL_STATUS.md: Overall implementation status
+
+================================================================================
