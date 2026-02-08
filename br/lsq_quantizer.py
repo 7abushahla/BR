@@ -62,9 +62,16 @@ class LSQ_WeightQuantizer(nn.Module):
         
         # SIGNED symmetric quantization: Qn=-(2^(b-1)), Qp=2^(b-1)-1
         # Example: 2-bit → Qn=-2, Qp=1 → levels: [-2s, -1s, 0, 1s]
-        self.Qn = -(2 ** (num_bits - 1))
-        self.Qp = 2 ** (num_bits - 1) - 1
-        self.num_levels = 2 ** num_bits
+        # Special case: 1-bit binary weights use {-1, +1} (not {-1, 0})
+        if num_bits == 1:
+            # Binary weights: {-α, +α}
+            self.Qn = -1
+            self.Qp = 1
+            self.num_levels = 2
+        else:
+            self.Qn = -(2 ** (num_bits - 1))
+            self.Qp = 2 ** (num_bits - 1) - 1
+            self.num_levels = 2 ** num_bits
         
         # Learnable scale parameter (alpha in LSQ paper, s in BR paper)
         # Initialize to a reasonable default
@@ -82,12 +89,16 @@ class LSQ_WeightQuantizer(nn.Module):
         Forward: x_q = round(x / alpha).clamp(Qn, Qp) * alpha
         Backward: STE for rounding, scaled gradient for alpha
         """
+        # Use a safe LSQ scaling factor for edge cases (e.g., signed 1-bit has Qp=0).
+        # Standard LSQ uses Qp, but that would cause divide-by-zero for W1.
+        q_scale = max(self.Qp, 1)
+
         # Data-driven initialization (on first pass)
         if self.training and self.init_state == 0:
             # Initialize alpha based on weight statistics (LSQ paper Eq. 8)
             # alpha = 2 * mean(|x|) / sqrt(Qp)
-            # NOTE: LSQ paper uses Qp (NOT max(|Qn|, |Qp|)) for symmetric quantization
-            init_alpha = 2 * x.abs().mean() / math.sqrt(self.Qp)
+            # NOTE: for W1, Qp=0 from signed range [-1, 0], so we use q_scale>=1.
+            init_alpha = 2 * x.abs().mean() / math.sqrt(q_scale)
             self.alpha.data.copy_(init_alpha)
             self.init_state.fill_(1)
             print(f"  [LSQ Weight Init] num_bits={self.num_bits}, Qn={self.Qn}, Qp={self.Qp}, "
@@ -95,8 +106,8 @@ class LSQ_WeightQuantizer(nn.Module):
         
         # Gradient scale factor for alpha (LSQ paper Eq. 7)
         # g = 1 / sqrt(numel * Qp)
-        # NOTE: LSQ paper uses Qp for the gradient scale
-        g = 1.0 / math.sqrt(x.numel() * self.Qp)
+        # NOTE: for W1, use q_scale to avoid division by zero.
+        g = 1.0 / math.sqrt(x.numel() * q_scale)
         
         # Scale alpha gradient
         alpha = grad_scale(self.alpha, g)
