@@ -482,8 +482,10 @@ def main():
     optimizer = optim.SGD(model.parameters(), lr=args.lr,
                          momentum=args.momentum, weight_decay=args.weight_decay)
 
-    # Learning rate scheduler (cosine annealing)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.qat_epochs)
+    # Learning rate scheduler (cosine annealing ONLY during BR phase)
+    # T_max should be the BR phase duration, not total epochs
+    br_phase_epochs = args.qat_epochs - args.warmup_epochs
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=br_phase_epochs)
     
     # Collect alpha parameters for optional freezing after warmup
     # Separate weight alphas from activation alphas
@@ -586,18 +588,20 @@ def main():
                 hook_manager=hook_manager, br_backprop_to_alpha_act=args.br_backprop_to_alpha_act, epoch=epoch, writer=writer
             )
 
-        # Step LR scheduler
-        scheduler.step()
+        # Step LR scheduler (ONLY during BR phase, not warmup)
+        if epoch > args.warmup_epochs:
+            scheduler.step()
 
         # Test
         test_loss, test_acc = test(model, test_loader, criterion, device, epoch=epoch, writer=writer)
 
-        # Print progress
+        # Print progress (get current LR)
+        current_lr = optimizer.param_groups[0]['lr']
         if epoch <= args.warmup_epochs:
-            print(f"Epoch {epoch}/{args.qat_epochs} [{stage}] (LR={scheduler.get_last_lr()[0]:.6f}): "
+            print(f"Epoch {epoch}/{args.qat_epochs} [{stage}] (LR={current_lr:.6f}): "
                   f"Train Acc={train_acc:.2f}%, Test Acc={test_acc:.2f}%")
         else:
-            print(f"Epoch {epoch}/{args.qat_epochs} [{stage}] (LR={scheduler.get_last_lr()[0]:.6f}): "
+            print(f"Epoch {epoch}/{args.qat_epochs} [{stage}] (LR={current_lr:.6f}): "
                   f"Train Acc={train_acc:.2f}%, Test Acc={test_acc:.2f}%, "
                   f"BR_W={br_w_loss:.6f}, BR_A={br_a_loss:.6f}")
 
