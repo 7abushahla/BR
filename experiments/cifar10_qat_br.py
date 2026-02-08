@@ -29,7 +29,6 @@ from torch.utils.data import DataLoader
 import argparse
 import os
 import sys
-from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 
 # Add parent directory to path to import br package
@@ -606,9 +605,7 @@ def main():
         if test_acc > best_acc:
             best_acc = test_acc
             best_epoch = epoch
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            checkpoint_path = os.path.join(checkpoint_dir,
-                                          f'best_seed{args.seed}_b{args.num_bits}_lam{args.lambda_br}_{timestamp}.pth')
+            checkpoint_path = os.path.join(checkpoint_dir, 'best.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
