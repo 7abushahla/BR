@@ -30,6 +30,7 @@ import argparse
 import os
 import sys
 from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
 
 # Add parent directory to path to import br package
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -173,7 +174,7 @@ class ResNet18_Quantized(nn.Module):
 def train_epoch(model, train_loader, criterion, optimizer, device,
                 regularizer_w=None, lambda_br=0.0,
                 regularizer_a=None, lambda_br_act=0.0,
-                hook_manager=None, br_backprop_to_alpha_act=False, epoch=0):
+                hook_manager=None, br_backprop_to_alpha_act=False, epoch=0, writer=None):
     """Train for one epoch"""
     model.train()
     running_loss = 0.0
@@ -251,10 +252,50 @@ def train_epoch(model, train_loader, criterion, optimizer, device,
     avg_br_a_loss = running_br_a_loss / len(train_loader) if regularizer_a is not None else 0.0
     accuracy = 100. * correct / total
 
+    # TensorBoard logging (if enabled)
+    if writer is not None:
+        # 1. Log training metrics
+        writer.add_scalar('Train/Loss_Total', avg_loss, epoch)
+        writer.add_scalar('Train/Loss_CE', avg_ce_loss, epoch)
+        writer.add_scalar('Train/Accuracy', accuracy, epoch)
+        
+        if regularizer_w is not None and lambda_br > 0:
+            writer.add_scalar('Train/Loss_BR_Weight', avg_br_w_loss, epoch)
+        
+        if regularizer_a is not None and lambda_br_act > 0:
+            writer.add_scalar('Train/Loss_BR_Activation', avg_br_a_loss, epoch)
+        
+        # 2. Log weight distributions (every 5 epochs to avoid overhead)
+        if epoch % 5 == 0:
+            for name, module in model.named_modules():
+                if hasattr(module, 'weight') and module.weight is not None:
+                    writer.add_histogram(f'Weights/{name}', module.weight.data.cpu(), epoch)
+                    
+                    # Log quantized weights if available
+                    if hasattr(module, 'weight_quantizer'):
+                        try:
+                            weight_q = module.weight_quantizer(module.weight)
+                            writer.add_histogram(f'Weights_Quantized/{name}', weight_q.data.cpu(), epoch)
+                        except:
+                            pass
+        
+        # 3. Log activation distributions (from hook manager if available)
+        if hook_manager is not None and epoch % 5 == 0:
+            activations_dict = hook_manager.get_pre_quant_activations()
+            for name, acts in activations_dict.items():
+                if acts is not None and acts.numel() > 0:
+                    writer.add_histogram(f'Activations/{name}', acts.cpu(), epoch)
+        
+        # 4. Log alpha values (LSQ scales)
+        if epoch % 5 == 0:
+            for name, param in model.named_parameters():
+                if 'alpha' in name:
+                    writer.add_scalar(f'Alpha/{name}', param.item(), epoch)
+
     return avg_loss, avg_ce_loss, avg_br_w_loss, avg_br_a_loss, accuracy
 
 
-def test(model, test_loader, criterion, device):
+def test(model, test_loader, criterion, device, epoch=0, writer=None):
     """Evaluate on test set"""
     model.eval()
     test_loss = 0.0
@@ -274,6 +315,11 @@ def test(model, test_loader, criterion, device):
 
     avg_loss = test_loss / len(test_loader)
     accuracy = 100. * correct / total
+
+    # TensorBoard logging (if enabled)
+    if writer is not None:
+        writer.add_scalar('Test/Loss', avg_loss, epoch)
+        writer.add_scalar('Test/Accuracy', accuracy, epoch)
 
     return avg_loss, accuracy
 
@@ -299,7 +345,8 @@ def main():
                        help='Number of bits for activation quantization only (default: 2). '
                             'Ignored if --num-bits is set. Use for asymmetric quantization (e.g., W4A8).')
     parser.add_argument('--clip-value', type=float, default=None,
-                       help='Activation clip value (None=standard ReLU, 6.0=ReLU6, etc.)')
+                       help='Activation clipping range (default: None). '
+                            'Options: None (standard ReLU, [0, inf)), 6.0 (ReLU6, [0, 6]), 1.0 (ReLU1, [0, 1])')
     
     # BR arguments
     parser.add_argument('--lambda-br', type=float, default=1.0,
@@ -336,6 +383,8 @@ def main():
                        help='Random seed (default: 42)')
     parser.add_argument('--output-dir', type=str, required=True,
                        help='Output directory for checkpoints and logs')
+    parser.add_argument('--tensorboard', action='store_true',
+                       help='Enable TensorBoard logging (weight/activation distributions, losses, etc.)')
     
     args = parser.parse_args()
 
@@ -361,6 +410,16 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     checkpoint_dir = os.path.join(args.output_dir, 'checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # TensorBoard writer (optional)
+    writer = None
+    if args.tensorboard:
+        log_dir = os.path.join(args.output_dir, 'tensorboard')
+        writer = SummaryWriter(log_dir)
+        print(f"✓ TensorBoard logging enabled: {log_dir}")
+        print(f"  Run: tensorboard --logdir {log_dir}")
+    else:
+        print("✗ TensorBoard logging disabled (use --tensorboard to enable)")
 
     # Data loaders
     print("Loading CIFAR-10 dataset...")
@@ -493,7 +552,7 @@ def main():
                 model, train_loader, criterion, optimizer, device,
                 regularizer_w=None, lambda_br=0.0,
                 regularizer_a=None, lambda_br_act=0.0,
-                hook_manager=None, br_backprop_to_alpha_act=False, epoch=epoch
+                hook_manager=None, br_backprop_to_alpha_act=False, epoch=epoch, writer=writer
             )
             
         # Stage 2: Joint training (LSQ + BR)
@@ -525,14 +584,14 @@ def main():
                 model, train_loader, criterion, optimizer, device,
                 regularizer_w=regularizer_w, lambda_br=args.lambda_br,
                 regularizer_a=regularizer_a, lambda_br_act=args.lambda_br_act,
-                hook_manager=hook_manager, br_backprop_to_alpha_act=args.br_backprop_to_alpha_act, epoch=epoch
+                hook_manager=hook_manager, br_backprop_to_alpha_act=args.br_backprop_to_alpha_act, epoch=epoch, writer=writer
             )
 
         # Step LR scheduler
         scheduler.step()
 
         # Test
-        test_loss, test_acc = test(model, test_loader, criterion, device)
+        test_loss, test_acc = test(model, test_loader, criterion, device, epoch=epoch, writer=writer)
 
         # Print progress
         if epoch <= args.warmup_epochs:
@@ -559,11 +618,20 @@ def main():
             }, checkpoint_path)
             print(f"  → Saved best model: {checkpoint_path}")
 
+    # Close TensorBoard writer
+    if writer is not None:
+        writer.close()
+        print(f"✓ TensorBoard logs saved")
+
     print(f"\n{'='*80}")
     print(f"Training Complete!")
     print(f"{'='*80}")
     print(f"Best Test Accuracy: {best_acc:.2f}% (Epoch {best_epoch})")
     print(f"Checkpoints saved to: {checkpoint_dir}")
+    if args.tensorboard:
+        log_dir = os.path.join(args.output_dir, 'tensorboard')
+        print(f"TensorBoard logs: {log_dir}")
+        print(f"  View with: tensorboard --logdir {log_dir}")
     print(f"{'='*80}\n")
 
 

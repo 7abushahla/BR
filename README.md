@@ -125,7 +125,7 @@ python experiments/cifar10_qat_br.py \
 | `--num-bits` | int | None | Symmetric quantization (same bits for W and A). Overrides separate settings. |
 | `--num-bits-weight` | int | 2 | Bit width for weights (1, 2, 4, 8, 32=FP32) |
 | `--num-bits-act` | int | 2 | Bit width for activations (1, 2, 4, 8, 32=FP32) |
-| `--clip-value` | float | None | Activation clipping (None=ReLU, 6.0=ReLU6, 1.0=ReLU1) |
+| `--clip-value` | float | None | **Activation range:** None=ReLU [0,∞), 6.0=ReLU6 [0,6], 1.0=ReLU1 [0,1] |
 
 **Examples:**
 - `--num-bits 2` → W2A2 (symmetric)
@@ -170,6 +170,7 @@ python experiments/cifar10_qat_br.py \
 | `--batch-size` | int | 128 | Training batch size |
 | `--lr` | float | 0.01 | Learning rate |
 | `--pretrained-baseline` | str | None | Path to FP32 baseline checkpoint |
+| `--tensorboard` | flag | False | Enable TensorBoard logging (distributions, losses, alphas) |
 
 ---
 
@@ -194,6 +195,118 @@ BR uses a **2-stage training** approach:
 
 ---
 
+## 📊 TensorBoard Visualization
+
+Enable TensorBoard logging with `--tensorboard` to visualize:
+
+### **What Gets Logged:**
+
+1. **Training Metrics** (every epoch):
+   - Total loss, CE loss, BR losses (W and A separately)
+   - Train accuracy, test accuracy
+
+2. **Weight Distributions** (every 5 epochs):
+   - FP32 weight histograms per layer
+   - Quantized weight histograms per layer
+   - See clustering effect during BR phase
+
+3. **Activation Distributions** (every 5 epochs):
+   - Pre-quantization activation histograms
+   - Post-quantization activation histograms
+   - Visualize BR's effect on activations
+
+4. **LSQ Alpha Values** (every 5 epochs):
+   - Track alpha (scale) evolution over time
+   - Monitor weight alphas vs activation alphas
+   - See impact of freezing
+
+### **Usage Example:**
+
+```bash
+# Train with TensorBoard enabled
+python experiments/cifar10_qat_br.py \
+    --pretrained-baseline results/baseline/best.pth \
+    --num-bits 2 \
+    --lambda-br 1.0 \
+    --lambda-br-act 1.0 \
+    --freeze-act-alpha \
+    --tensorboard \
+    --output-dir results/w2a2_tensorboard/
+
+# In another terminal, start TensorBoard
+tensorboard --logdir results/w2a2_tensorboard/tensorboard
+
+# Open browser to http://localhost:6006
+```
+
+### **What to Look For:**
+
+- **Histograms Tab:**
+  - Weights should cluster tightly around quantization levels during BR phase
+  - Activations should show reduced variance within bins
+  - Compare FP32 vs quantized distributions
+
+- **Scalars Tab:**
+  - BR losses should decrease over epochs
+  - Test accuracy should improve or stabilize
+  - Alpha values should converge (if not frozen)
+
+- **Expected Patterns:**
+  - **Warmup:** Alphas adjust, distributions spread out
+  - **BR Phase:** Distributions sharpen, cluster around levels
+  - **After Freeze:** Alphas constant, distributions continue to cluster
+
+**Note:** Logging every 5 epochs (for distributions) avoids performance overhead while still showing trends.
+
+---
+
+## 🔧 Activation Clipping Options
+
+Control the activation range with `--clip-value`:
+
+### **Option 1: Standard ReLU (Unbounded)**
+```bash
+python experiments/cifar10_qat_br.py \
+    --clip-value None \  # or omit (default)
+    --num-bits 2 \
+    --output-dir results/relu/
+```
+**Range:** [0, ∞)  
+**Quantization:** [0, α, 2α, ..., (2^b-1)α] (e.g., [0, α, 2α, 3α] for 2-bit)  
+**Use case:** Standard networks, no activation clipping
+
+### **Option 2: ReLU6 (Clip at 6)**
+```bash
+python experiments/cifar10_qat_br.py \
+    --clip-value 6.0 \
+    --num-bits 2 \
+    --output-dir results/relu6/
+```
+**Range:** [0, 6]  
+**Quantization:** [0, 2, 4, 6] for 2-bit, [0, 0.75, 1.5, ..., 6] for 8-bit  
+**Use case:** MobileNets, efficient networks (better for low-bit quantization)
+
+### **Option 3: ReLU1 (Clip at 1)**
+```bash
+python experiments/cifar10_qat_br.py \
+    --clip-value 1.0 \
+    --num-bits 2 \
+    --output-dir results/relu1/
+```
+**Range:** [0, 1]  
+**Quantization:** [0, 0.33, 0.67, 1.0] for 2-bit, [0, 0.125, 0.25, ..., 1] for 8-bit  
+**Use case:** Normalized activations, ultra low-bit (1-bit, 2-bit)
+
+### **Custom Clipping:**
+```bash
+--clip-value 3.0  # Custom: [0, 3]
+--clip-value 10.0 # Custom: [0, 10]
+```
+
+**Note:** The baseline model should be trained with the same clip value for best results.
+
+---
+
 ## 💡 Common Use Cases
 
 ### **1. Paper-Faithful W-BR (Original)**
@@ -201,6 +314,7 @@ BR uses a **2-stage training** approach:
 python experiments/cifar10_qat_br.py \
     --pretrained-baseline results/baseline/best.pth \
     --num-bits 2 \
+    --clip-value None \      # Standard ReLU
     --lambda-br 1.0 \
     --lambda-br-act 0.0 \
     --warmup-epochs 30 \
@@ -219,8 +333,10 @@ python experiments/cifar10_qat_br.py \
     --warmup-epochs 30 \
     --qat-epochs 100 \
     --freeze-act-alpha \
+    --tensorboard \
     --output-dir results/full_w_a_br/
 # W alpha adapts, A alpha frozen (stable)
+# TensorBoard: tensorboard --logdir results/full_w_a_br/tensorboard
 ```
 
 ### **3. W4A8 Deployment Configuration**
@@ -252,11 +368,39 @@ python experiments/cifar10_qat_br.py \
 # Binary weights need strong BR and more training
 ```
 
-### **5. Ablation: A-BR Only**
+### **5. ReLU6 for Better Low-Bit Quantization**
+```bash
+python experiments/cifar10_qat_br.py \
+    --pretrained-baseline results/baseline/best_relu6.pth \
+    --num-bits 2 \
+    --clip-value 6.0 \       # ReLU6: [0, 6]
+    --lambda-br 1.0 \
+    --lambda-br-act 1.0 \
+    --freeze-act-alpha \
+    --output-dir results/relu6_w2a2/
+# Bounded activations work better for 2-bit quantization
+```
+
+### **6. ReLU1 for Ultra Low-Bit (1-bit, 2-bit)**
+```bash
+python experiments/cifar10_qat_br.py \
+    --pretrained-baseline results/baseline/best_relu1.pth \
+    --num-bits 2 \
+    --clip-value 1.0 \       # ReLU1: [0, 1]
+    --lambda-br 1.0 \
+    --lambda-br-act 1.0 \
+    --freeze-weight-alpha \
+    --freeze-act-alpha \
+    --output-dir results/relu1_w2a2/
+# Normalized range helps with extreme quantization
+```
+
+### **7. Ablation: A-BR Only**
 ```bash
 python experiments/cifar10_qat_br.py \
     --pretrained-baseline results/baseline/best.pth \
     --num-bits 2 \
+    --clip-value None \
     --lambda-br 0.0 \
     --lambda-br-act 1.0 \
     --freeze-act-alpha \
